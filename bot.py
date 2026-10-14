@@ -227,7 +227,8 @@ def is_admin(user_id: int) -> bool:
 async def cmd_start(m: Message, state: FSMContext):
     await state.clear()
     await m.answer(
-        f"Вітаємо! 👋 Я допоможу залишити запит на запис.\n\n{WORK_HOURS_TEXT}\n\nНатисніть кнопку нижче.",
+        "Доброго дня! 👋 Раді вас бачити.\n\nЯ допоможу записатися на хімчистку, поліровку чи оптику. "
+        "Натисніть «Записатися» нижче, і ми підберемо зручний для вас час.",
         reply_markup=main_kb(),
     )
 
@@ -295,7 +296,7 @@ async def ask_day(message: Message, state: FSMContext):
         d += timedelta(days=1)
     kb.adjust(2)
     await message.answer(
-        f"{WORK_HOURS_TEXT}\nСубота й неділя вихідні.\n\nОберіть бажаний день:",
+        f"📅 Коли вам зручно приїхати?\n\n{WORK_HOURS_TEXT}\nСубота й неділя у нас вихідні.\n\nОберіть бажаний день:",
         reply_markup=kb.as_markup(),
     )
 
@@ -347,7 +348,7 @@ async def got_day(cb: CallbackQuery, state: FSMContext):
     kb.button(text="Будь-який час", callback_data="time:будь-який час")
     kb.adjust(3)
     await cb.message.edit_text(
-        f"День: <b>{day_label(d)}</b>\n\nОберіть бажаний час (точний час ми підтвердимо окремо):",
+        f"День: <b>{day_label(d)}</b>\n\n🕙 Записатися можна з 10:00 до 19:00.\nОберіть бажаний час, а точний ми підтвердимо окремо:",
         reply_markup=kb.as_markup(),
     )
     await cb.answer()
