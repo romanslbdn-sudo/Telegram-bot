@@ -1,22 +1,26 @@
 """
-Телеграм-бот для запису клієнтів на прийом.
+Телеграм-бот для запису клієнтів на прийом (з Google-таблицею).
 
 Потік:
-1. Клієнт: ім'я -> телефон -> послуга -> бажаний день -> бажаний час -> коментар.
-2. Бот зберігає запит і каже: «Ми повідомимо про точний час».
+1. Клієнт: ім'я -> телефон -> послуга -> марка авто -> номерний знак ->
+   бажаний день -> бажаний час -> коментар.
+2. Бот каже клієнту, що точний час повідомлять додатково.
 3. Адміністратору приходить запит з кнопками:
    ✅ Підтвердити як є | 🕒 Запропонувати інший час | ❌ Відхилити
-4. Якщо запропоновано інший час, клієнт отримує кнопки «Підходить / Не підходить».
+4. Кожен запит і кожна зміна статусу записується в Google-таблицю
+   (якщо задано SHEET_URL).
 """
 import asyncio
 import html
 import logging
 import os
 import sqlite3
-import threading
-from datetime import date, timedelta, datetime, time
-from flask import Flask
+from datetime import date, datetime, timedelta
+from datetime import time as dtime
+from zoneinfo import ZoneInfo
 
+import aiohttp
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -36,14 +40,29 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # ---------------------------------------------------------------- налаштування
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 # ID адміністраторів через кому, напр. ADMIN_IDS=123456789,987654321
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
+# Якщо змінна ADMIN_IDS не задана в Render, запити все одно підуть власнику (ID можна змінити/доповнити змінною)
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "531685798").split(",") if x.strip()}
 DB_PATH = os.getenv("DB_PATH", "bookings.db")
+# Адреса веб-застосунку Google Apps Script і спільний пароль (необов'язково)
+SHEET_URL = os.getenv("SHEET_URL", "")
+SHEET_SECRET = os.getenv("SHEET_SECRET", "")
+
+# Часовий пояс (сервер Render живе за UTC, тому вказуємо Київ) і мінімальний запас до візиту
+TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Kyiv"))
+MIN_LEAD_MINUTES = int(os.getenv("MIN_LEAD_MINUTES", "60"))
 
 # Відредагуйте під себе
 SERVICES = ["Послуга 1", "Послуга 2", "Послуга 3", "Консультація"]
 TIME_SLOTS = ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00"]
 DAYS_AHEAD = 7
 WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "нд"]
+
+STATUS_UA = {
+    "new": "Новий запит",
+    "proposed": "Запропоновано інший час",
+    "confirmed": "Підтверджено",
+    "declined": "Відхилено",
+}
 
 BTN_BOOK = "📝 Записатися"
 
@@ -64,12 +83,18 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 name TEXT, phone TEXT, service TEXT,
+                car TEXT, plate TEXT,
                 wanted TEXT, comment TEXT,
                 status TEXT DEFAULT 'new',
                 final_time TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )"""
         )
+        # міграція зі старої версії бази (без марки авто і номера)
+        cols = {row["name"] for row in c.execute("PRAGMA table_info(bookings)")}
+        for col in ("car", "plate"):
+            if col not in cols:
+                c.execute(f"ALTER TABLE bookings ADD COLUMN {col} TEXT")
 
 
 def get_booking(booking_id: int):
@@ -85,11 +110,47 @@ def set_status(booking_id: int, status: str, final_time: str | None = None) -> N
         )
 
 
+# ------------------------------------------------------------ Google-таблиця
+async def push_sheet(booking_id: int) -> None:
+    """Надсилає (або оновлює) рядок запису в Google-таблиці."""
+    if not SHEET_URL:
+        return
+    r = get_booking(booking_id)
+    if not r:
+        return
+    visit_time = r["final_time"] if r["status"] in ("proposed", "confirmed") and r["final_time"] else r["wanted"]
+    payload = {
+        "secret": SHEET_SECRET,
+        "id": r["id"],
+        "name": r["name"] or "",
+        "phone": r["phone"] or "",
+        "time": visit_time or "",
+        "service": r["service"] or "",
+        "car": r["car"] or "",
+        "plate": r["plate"] or "",
+        "comment": r["comment"] or "",
+        "status": STATUS_UA.get(r["status"], r["status"]),
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(SHEET_URL, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                await resp.read()
+    except Exception as exc:
+        logging.warning("Не вдалося записати в Google-таблицю: %s", exc)
+
+
+async def update_status(booking_id: int, status: str, final_time: str | None = None) -> None:
+    set_status(booking_id, status, final_time)
+    await push_sheet(booking_id)
+
+
 # --------------------------------------------------------------------- стани
 class Booking(StatesGroup):
     name = State()
     phone = State()
     service = State()
+    car = State()
+    plate = State()
     day = State()
     time = State()
     comment = State()
@@ -110,6 +171,7 @@ def booking_text(r: sqlite3.Row) -> str:
         f"👤 {e(r['name'])} (<a href=\"tg://user?id={r['user_id']}\">профіль</a>)\n"
         f"📞 {e(r['phone'])}\n"
         f"🛠 {e(r['service'])}\n"
+        f"🚗 {e(r['car'])}, {e(r['plate'])}\n"
         f"🗓 Бажаний час: <b>{e(r['wanted'])}</b>\n"
         f"💬 {e(r['comment'])}"
     )
@@ -128,8 +190,12 @@ def main_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_BOOK)]], resize_keyboard=True)
 
 
+def now_local() -> datetime:
+    return datetime.now(TZ)
+
+
 def day_label(d: date) -> str:
-    prefix = {0: "Сьогодні", 1: "Завтра"}.get((d - date.today()).days)
+    prefix = {0: "Сьогодні", 1: "Завтра"}.get((d - now_local().date()).days)
     base = f"{d.strftime('%d.%m')} ({WEEKDAYS[d.weekday()]})"
     return f"{prefix}, {base}" if prefix else base
 
@@ -205,39 +271,49 @@ async def got_phone_text(m: Message, state: FSMContext):
 async def got_service(cb: CallbackQuery, state: FSMContext):
     service = SERVICES[int(cb.data.split(":")[1])]
     await state.update_data(service=service)
+    await state.set_state(Booking.car)
+    await cb.message.edit_text(f"Послуга: <b>{e(service)}</b>")
+    await cb.message.answer("Яка марка і модель вашого авто? (напр. Skoda Octavia)")
+    await cb.answer()
+
+
+@router.message(Booking.car, F.text)
+async def got_car(m: Message, state: FSMContext):
+    await state.update_data(car=m.text.strip()[:60])
+    await state.set_state(Booking.plate)
+    await m.answer("Який номерний знак авто? (напр. AT1234AA)")
+
+
+@router.message(Booking.plate, F.text)
+async def got_plate(m: Message, state: FSMContext):
+    await state.update_data(plate=m.text.strip().upper()[:15])
     await state.set_state(Booking.day)
     kb = InlineKeyboardBuilder()
-    today = date.today()
+    today = now_local().date()
     for i in range(DAYS_AHEAD):
         d = today + timedelta(days=i)
         kb.button(text=day_label(d), callback_data=f"day:{d.isoformat()}")
     kb.adjust(2)
-    await cb.message.edit_text(f"Послуга: <b>{e(service)}</b>\n\nОберіть бажаний день:", reply_markup=kb.as_markup())
-    await cb.answer()
+    await m.answer("Оберіть бажаний день:", reply_markup=kb.as_markup())
 
 
 @router.callback_query(Booking.day, F.data.startswith("day:"))
 async def got_day(cb: CallbackQuery, state: FSMContext):
     d = date.fromisoformat(cb.data.split(":", 1)[1])
-    # Зберігаємо і текстовий лейбл, і ISO-формат дати для валідації часу
-    await state.update_data(day=day_label(d), day_iso=d.isoformat())
-    await state.set_state(Booking.time)
-    
-    kb = InlineKeyboardBuilder()
-    now = datetime.now()
-    is_today = (d == now.date())
-    
+    earliest = now_local() + timedelta(minutes=MIN_LEAD_MINUTES)
+    slots = []
     for t in TIME_SLOTS:
-        if is_today:
-            try:
-                h, m = map(int, t.split(":"))
-                # Якщо час слота вже минув або настав — пропускаємо його
-                if time(h, m) <= now.time():
-                    continue
-            except ValueError:
-                pass
+        hh, mm = map(int, t.split(":"))
+        if datetime.combine(d, dtime(hh, mm), tzinfo=TZ) >= earliest:
+            slots.append(t)
+    if not slots:
+        await cb.answer("На цей день вільних годин уже немає. Оберіть інший день.", show_alert=True)
+        return
+    await state.update_data(day=day_label(d))
+    await state.set_state(Booking.time)
+    kb = InlineKeyboardBuilder()
+    for t in slots:
         kb.button(text=t, callback_data=f"time:{t}")
-        
     kb.button(text="Будь-який час", callback_data="time:будь-який час")
     kb.adjust(3)
     await cb.message.edit_text(
@@ -249,29 +325,12 @@ async def got_day(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(Booking.time, F.data.startswith("time:"))
 async def got_time(cb: CallbackQuery, state: FSMContext):
-    time_val = cb.data.split(":", 1)[1]
-    
-    # Додаткова перевірка на випадок застарілих даних або маніпуляцій
-    if time_val != "будь-який час":
-        data = await state.get_data()
-        day_iso = data.get("day_iso")
-        if day_iso:
-            d = date.fromisoformat(day_iso)
-            if d == date.today():
-                try:
-                    h, m = map(int, time_val.split(":"))
-                    if datetime.now().time() > time(h, m):
-                        await cb.answer("Цей час вже минув! Будь ласка, оберіть актуальний час.", show_alert=True)
-                        return
-                except ValueError:
-                    pass
-
-    await state.update_data(time=time_val)
+    await state.update_data(time=cb.data.split(":", 1)[1])
     await state.set_state(Booking.comment)
     kb = InlineKeyboardBuilder()
     kb.button(text="Пропустити", callback_data="skip_comment")
     await cb.message.edit_text(
-        "Додайте коментар (марка авто, побажання тощо) або натисніть «Пропустити».",
+        "Додайте коментар (побажання тощо) або натисніть «Пропустити».",
         reply_markup=kb.as_markup(),
     )
     await cb.answer()
@@ -282,8 +341,9 @@ async def finalize(bot: Bot, chat_id: int, user_id: int, state: FSMContext, comm
     wanted = f"{data['day']}, {data['time']}"
     with db() as c:
         cur = c.execute(
-            "INSERT INTO bookings (user_id, name, phone, service, wanted, comment) VALUES (?,?,?,?,?,?)",
-            (user_id, data["name"], data["phone"], data["service"], wanted, comment),
+            "INSERT INTO bookings (user_id, name, phone, service, car, plate, wanted, comment) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (user_id, data["name"], data["phone"], data["service"], data["car"], data["plate"], wanted, comment),
         )
         booking_id = cur.lastrowid
     await state.clear()
@@ -291,11 +351,13 @@ async def finalize(bot: Bot, chat_id: int, user_id: int, state: FSMContext, comm
     await bot.send_message(
         chat_id,
         f"✅ Дякуємо, {e(data['name'])}! Ваш запит прийнято.\n\n"
-        f"🛠 {e(data['service'])}\n🗓 Бажаний час: <b>{e(wanted)}</b>\n\n"
+        f"🛠 {e(data['service'])}\n🚗 {e(data['car'])}, {e(data['plate'])}\n"
+        f"🗓 Бажаний час: <b>{e(wanted)}</b>\n\n"
         "Ми повідомимо вас про точний час прийому, який ми зможемо запропонувати.",
         reply_markup=main_kb(),
     )
     await notify_admins(bot, booking_text(get_booking(booking_id)), admin_kb(booking_id))
+    await push_sheet(booking_id)
 
 
 @router.message(Booking.comment, F.text)
@@ -324,12 +386,12 @@ async def admin_action(cb: CallbackQuery, state: FSMContext, bot: Bot):
         return
 
     if action == "ok":
-        set_status(booking_id, "confirmed", r["wanted"])
+        await update_status(booking_id, "confirmed", r["wanted"])
         await bot.send_message(
             r["user_id"],
             f"✅ Ваш запис підтверджено на <b>{e(r['wanted'])}</b>. Чекаємо на вас!",
         )
-        await cb.message.edit_text(booking_text(r) + "\n\n✅ <b>Підтверджено</b>", reply_markup=None)
+        await cb.message.edit_text(cb.message.html_text + "\n\n✅ <b>Підтверджено</b>", reply_markup=None)
 
     elif action == "alt":
         await state.set_state(Propose.waiting_time)
@@ -340,14 +402,14 @@ async def admin_action(cb: CallbackQuery, state: FSMContext, bot: Bot):
         )
 
     elif action == "no":
-        set_status(booking_id, "declined")
+        await update_status(booking_id, "declined")
         await bot.send_message(
             r["user_id"],
             "На жаль, на бажаний час ми не можемо вас прийняти. "
             "Ми зв'яжемося з вами, щоб підібрати інший варіант, або ви можете залишити новий запит.",
             reply_markup=main_kb(),
         )
-        await cb.message.edit_text(booking_text(r) + "\n\n❌ <b>Відхилено</b>", reply_markup=None)
+        await cb.message.edit_text(cb.message.html_text + "\n\n❌ <b>Відхилено</b>", reply_markup=None)
 
     await cb.answer()
 
@@ -366,7 +428,7 @@ async def admin_proposes(m: Message, state: FSMContext, bot: Bot):
     booking_id = data["booking_id"]
     r = get_booking(booking_id)
     new_time = m.text.strip()[:100]
-    set_status(booking_id, "proposed", new_time)
+    await update_status(booking_id, "proposed", new_time)
     await state.clear()
 
     kb = InlineKeyboardBuilder()
@@ -392,14 +454,28 @@ async def client_reply(cb: CallbackQuery, bot: Bot):
         return
 
     if action == "ok":
-        set_status(booking_id, "confirmed")
+        await update_status(booking_id, "confirmed")
         await cb.message.edit_text(f"✅ Домовились! Чекаємо на вас: <b>{e(r['final_time'])}</b>.")
-        await notify_admins(bot, f"✅ Клієнт підтвердив час для запиту #{booking_id}: <b>{e(r['final_time'])}</b>\n👤 {e(r['name'])}, 📞 {e(r['phone'])}")
+        await notify_admins(
+            bot,
+            f"✅ Клієнт підтвердив час для запиту #{booking_id}: <b>{e(r['final_time'])}</b>\n"
+            f"👤 {e(r['name'])}, 📞 {e(r['phone'])}",
+        )
     else:
-        set_status(booking_id, "new")
+        await update_status(booking_id, "new")
         await cb.message.edit_text("Зрозуміло. Ми зв'яжемося з вами, щоб підібрати інший час.")
-        await notify_admins(bot, f"⚠️ Клієнту не підійшов запропонований час (запит #{booking_id}).", admin_kb(booking_id))
+        await notify_admins(
+            bot,
+            f"⚠️ Клієнту не підійшов запропонований час (запит #{booking_id}).",
+            admin_kb(booking_id),
+        )
     await cb.answer()
+
+
+@router.message(Command("myid"))
+async def my_id(m: Message):
+    status = "ви в списку адміністраторів ✅" if is_admin(m.from_user.id) else "вас НЕМАЄ в списку адміністраторів ❌"
+    await m.answer(f"Ваш ID: <code>{m.from_user.id}</code>\n{status}")
 
 
 # ------------------------------------------------------------ адмін: список
@@ -426,39 +502,46 @@ async def list_confirmed(m: Message):
     if not rows:
         await m.answer("Підтверджених записів поки немає.")
         return
-    await m.answer("\n".join(f"#{r['id']} {e(r['final_time'])} — {e(r['name'])}, {e(r['phone'])}, {e(r['service'])}" for r in rows))
-
-
-# ---------------------------------------------------------------------- Flask Keep-Alive для Render
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "Bot is active and running!"
-
-def run_flask():
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
-
-def keep_alive():
-    t = threading.Thread(target=run_flask)
-    t.daemon = True
-    t.start()
+    await m.answer(
+        "\n".join(
+            f"#{r['id']} {e(r['final_time'])} — {e(r['name'])}, {e(r['phone'])}, "
+            f"{e(r['service'])}, {e(r['car'])} {e(r['plate'])}"
+            for r in rows
+        )
+    )
 
 
 # ---------------------------------------------------------------------- запуск
+async def start_web_server() -> None:
+    """Маленький веб-сервер: Render (веб-сервіс) вимагає відкритий порт,
+    а зовнішній пінг цієї адреси не дає безкоштовному серверу заснути."""
+    port = os.getenv("PORT")
+    if not port:
+        return
+
+    async def health(_request):
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(port)).start()
+    logging.info("Веб-сервер запущено на порту %s", port)
+
+
 async def main():
     logging.basicConfig(level=logging.INFO)
+    logging.info("Адміністратори (ADMIN_IDS): %s", sorted(ADMIN_IDS))
     if not ADMIN_IDS:
         logging.warning("ADMIN_IDS не заданий — адміністратор не отримуватиме запити!")
+    if not SHEET_URL:
+        logging.info("SHEET_URL не заданий — запис у Google-таблицю вимкнено.")
     init_db()
-    
-    # Запускаємо веб-сервер для Render у фоновому потоці
-    keep_alive()
-
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+    await start_web_server()
     await dp.start_polling(bot)
 
 
