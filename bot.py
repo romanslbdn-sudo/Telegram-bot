@@ -14,7 +14,7 @@ import logging
 import os
 import sqlite3
 import threading
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, time
 from flask import Flask
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -129,7 +129,7 @@ def main_kb() -> ReplyKeyboardMarkup:
 
 
 def day_label(d: date) -> str:
-    prefix = {0: "Сьогодні", 1: "Завтра"}.get(( d - date.today()).days)
+    prefix = {0: "Сьогодні", 1: "Завтра"}.get((d - date.today()).days)
     base = f"{d.strftime('%d.%m')} ({WEEKDAYS[d.weekday()]})"
     return f"{prefix}, {base}" if prefix else base
 
@@ -219,11 +219,25 @@ async def got_service(cb: CallbackQuery, state: FSMContext):
 @router.callback_query(Booking.day, F.data.startswith("day:"))
 async def got_day(cb: CallbackQuery, state: FSMContext):
     d = date.fromisoformat(cb.data.split(":", 1)[1])
-    await state.update_data(day=day_label(d))
+    # Зберігаємо і текстовий лейбл, і ISO-формат дати для валідації часу
+    await state.update_data(day=day_label(d), day_iso=d.isoformat())
     await state.set_state(Booking.time)
+    
     kb = InlineKeyboardBuilder()
+    now = datetime.now()
+    is_today = (d == now.date())
+    
     for t in TIME_SLOTS:
+        if is_today:
+            try:
+                h, m = map(int, t.split(":"))
+                # Якщо час слота вже минув або настав — пропускаємо його
+                if time(h, m) <= now.time():
+                    continue
+            except ValueError:
+                pass
         kb.button(text=t, callback_data=f"time:{t}")
+        
     kb.button(text="Будь-який час", callback_data="time:будь-який час")
     kb.adjust(3)
     await cb.message.edit_text(
@@ -235,7 +249,24 @@ async def got_day(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(Booking.time, F.data.startswith("time:"))
 async def got_time(cb: CallbackQuery, state: FSMContext):
-    await state.update_data(time=cb.data.split(":", 1)[1])
+    time_val = cb.data.split(":", 1)[1]
+    
+    # Додаткова перевірка на випадок застарілих даних або маніпуляцій
+    if time_val != "будь-який час":
+        data = await state.get_data()
+        day_iso = data.get("day_iso")
+        if day_iso:
+            d = date.fromisoformat(day_iso)
+            if d == date.today():
+                try:
+                    h, m = map(int, time_val.split(":"))
+                    if datetime.now().time() > time(h, m):
+                        await cb.answer("Цей час вже минув! Будь ласка, оберіть актуальний час.", show_alert=True)
+                        return
+                except ValueError:
+                    pass
+
+    await state.update_data(time=time_val)
     await state.set_state(Booking.comment)
     kb = InlineKeyboardBuilder()
     kb.button(text="Пропустити", callback_data="skip_comment")
@@ -298,7 +329,7 @@ async def admin_action(cb: CallbackQuery, state: FSMContext, bot: Bot):
             r["user_id"],
             f"✅ Ваш запис підтверджено на <b>{e(r['wanted'])}</b>. Чекаємо на вас!",
         )
-        await cb.message.edit_text(cb.message.html_text + "\n\n✅ <b>Підтверджено</b>", reply_markup=None)
+        await cb.message.edit_text(booking_text(r) + "\n\n✅ <b>Підтверджено</b>", reply_markup=None)
 
     elif action == "alt":
         await state.set_state(Propose.waiting_time)
@@ -316,7 +347,7 @@ async def admin_action(cb: CallbackQuery, state: FSMContext, bot: Bot):
             "Ми зв'яжемося з вами, щоб підібрати інший варіант, або ви можете залишити новий запит.",
             reply_markup=main_kb(),
         )
-        await cb.message.edit_text(cb.message.html_text + "\n\n❌ <b>Відхилено</b>", reply_markup=None)
+        await cb.message.edit_text(booking_text(r) + "\n\n❌ <b>Відхилено</b>", reply_markup=None)
 
     await cb.answer()
 
@@ -399,26 +430,37 @@ async def list_confirmed(m: Message):
 
 
 # ---------------------------------------------------------------------- Flask Keep-Alive для Render
-app = Flask('')
+app = Flask(__name__)
 
 @app.route('/')
 def home():
     return "Bot is active and running!"
 
-def run_bot():
-    asyncio.run(main())
+def run_flask():
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = threading.Thread(target=run_flask)
+    t.daemon = True
+    t.start()
+
 
 # ---------------------------------------------------------------------- запуск
-if __name__ == "__main__":
+async def main():
     logging.basicConfig(level=logging.INFO)
     if not ADMIN_IDS:
         logging.warning("ADMIN_IDS не заданий — адміністратор не отримуватиме запити!")
     init_db()
     
-    # Запускаємо телеграм-бота у фоновому потоці
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
+    # Запускаємо веб-сервер для Render у фоновому потоці
+    keep_alive()
 
-    # Flask запускаємо на головному потоці — він миттєво відкриє порт для Render
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
