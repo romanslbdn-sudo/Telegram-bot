@@ -54,7 +54,7 @@ TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Kyiv"))
 MIN_LEAD_MINUTES = int(os.getenv("MIN_LEAD_MINUTES", "60"))
 
 # Відредагуйте під себе
-SERVICES = ["Хімчистка", "Поліровка", "Робота з оптикою"]
+SERVICES = ["Хімчистка", "Поліровка", "Оптика"]
 TIME_SLOTS = ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00"]
 DAYS_AHEAD = 7
 WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "нд"]
@@ -429,8 +429,9 @@ async def admin_action(cb: CallbackQuery, state: FSMContext, bot: Bot):
         await update_status(booking_id, "declined")
         await bot.send_message(
             r["user_id"],
-            "На жаль, на бажаний час ми не можемо вас прийняти. "
-            "Ми зв'яжемося з вами, щоб підібрати інший варіант, або ви можете залишити новий запит.",
+            "Вибачте, на цей час ми, на жаль, не можемо вас прийняти. 🙏\n"
+            "Будь ласка, оберіть інший зручний для вас час: натисніть «📝 Записатися» нижче, "
+            "і ми з радістю вас запишемо.",
             reply_markup=main_kb(),
         )
         await cb.message.edit_text(cb.message.html_text + "\n\n❌ <b>Відхилено</b>", reply_markup=None)
@@ -487,7 +488,12 @@ async def client_reply(cb: CallbackQuery, bot: Bot):
         )
     else:
         await update_status(booking_id, "new")
-        await cb.message.edit_text("Зрозуміло. Ми зв'яжемося з вами, щоб підібрати інший час.")
+        await cb.message.edit_text("Зрозуміло, дякуємо за відповідь. 🙏")
+        await bot.send_message(
+            r["user_id"],
+            "Будь ласка, оберіть інший зручний для вас час: натисніть «📝 Записатися» нижче.",
+            reply_markup=main_kb(),
+        )
         await notify_admins(
             bot,
             f"⚠️ Клієнту не підійшов запропонований час (запит #{booking_id}).",
