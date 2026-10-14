@@ -405,31 +405,20 @@ app = Flask('')
 def home():
     return "Bot is active and running!"
 
-def run_flask():
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
-
-def keep_alive():
-    t = threading.Thread(target=run_flask)
-    t.daemon = True
-    t.start()
-
+def run_bot():
+    asyncio.run(main())
 
 # ---------------------------------------------------------------------- запуск
-async def main():
+if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     if not ADMIN_IDS:
         logging.warning("ADMIN_IDS не заданий — адміністратор не отримуватиме запити!")
     init_db()
     
-    # Запускаємо веб-сервер для Render у фоновому потоці
-    keep_alive()
+    # Запускаємо телеграм-бота у фоновому потоці
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
 
-    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    # Flask запускаємо на головному потоці — він миттєво відкриє порт для Render
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
