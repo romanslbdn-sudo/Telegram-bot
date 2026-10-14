@@ -47,7 +47,7 @@ DB_PATH = os.getenv("DB_PATH", "bookings.db")
 SHEET_URL = os.getenv("SHEET_URL", "")
 SHEET_SECRET = os.getenv("SHEET_SECRET", "")
 # ID закритої групи (від'ємне число), куди приходять запити. Якщо не задано, запити йдуть адміністраторам особисто
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or 0)
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "-1004402579731") or 0)
 
 # Часовий пояс (сервер Render живе за UTC, тому вказуємо Київ) і мінімальний запас до візиту
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Kyiv"))
