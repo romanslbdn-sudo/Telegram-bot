@@ -565,6 +565,24 @@ async def start_web_server() -> None:
     logging.info("Веб-сервер запущено на порту %s", port)
 
 
+async def keep_awake() -> None:
+    """Самопробудження: кожні 10 хвилин бот заходить на власну адресу,
+    тож безкоштовний Render не вважає сервіс неактивним і не присипляє його.
+    RENDER_EXTERNAL_URL Render задає сам; можна перевизначити через SELF_URL."""
+    url = os.getenv("SELF_URL") or os.getenv("RENDER_EXTERNAL_URL")
+    if not url:
+        return
+    await asyncio.sleep(60)
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    logging.info("Самопробудження: %s -> %s", url, resp.status)
+        except Exception as exc:
+            logging.warning("Самопробудження не вдалося: %s", exc)
+        await asyncio.sleep(600)
+
+
 async def main():
     logging.basicConfig(level=logging.INFO)
     logging.info("Адміністратори (ADMIN_IDS): %s", sorted(ADMIN_IDS))
@@ -578,6 +596,7 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await start_web_server()
+    awake_task = asyncio.create_task(keep_awake())  # noqa: F841 — тримаємо посилання
     await dp.start_polling(bot)
 
 
