@@ -46,6 +46,8 @@ DB_PATH = os.getenv("DB_PATH", "bookings.db")
 # Адреса веб-застосунку Google Apps Script і спільний пароль (необов'язково)
 SHEET_URL = os.getenv("SHEET_URL", "")
 SHEET_SECRET = os.getenv("SHEET_SECRET", "")
+# ID закритої групи (від'ємне число), куди приходять запити. Якщо не задано, запити йдуть адміністраторам особисто
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or 0)
 
 # Часовий пояс (сервер Render живе за UTC, тому вказуємо Київ) і мінімальний запас до візиту
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Kyiv"))
@@ -84,7 +86,7 @@ def init_db() -> None:
                 user_id INTEGER NOT NULL,
                 name TEXT, phone TEXT, service TEXT,
                 car TEXT, plate TEXT,
-                wanted TEXT, comment TEXT,
+                wanted TEXT, wanted_plain TEXT, comment TEXT,
                 status TEXT DEFAULT 'new',
                 final_time TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -92,7 +94,7 @@ def init_db() -> None:
         )
         # міграція зі старої версії бази (без марки авто і номера)
         cols = {row["name"] for row in c.execute("PRAGMA table_info(bookings)")}
-        for col in ("car", "plate"):
+        for col in ("car", "plate", "wanted_plain"):
             if col not in cols:
                 c.execute(f"ALTER TABLE bookings ADD COLUMN {col} TEXT")
 
@@ -118,7 +120,7 @@ async def push_sheet(booking_id: int) -> None:
     r = get_booking(booking_id)
     if not r:
         return
-    visit_time = r["final_time"] if r["status"] in ("proposed", "confirmed") and r["final_time"] else r["wanted"]
+    visit_time = r["final_time"] or r["wanted_plain"] or r["wanted"]
     payload = {
         "secret": SHEET_SECRET,
         "id": r["id"],
@@ -126,8 +128,8 @@ async def push_sheet(booking_id: int) -> None:
         "phone": r["phone"] or "",
         "time": visit_time or "",
         "service": r["service"] or "",
-        "car": r["car"] or "",
-        "plate": r["plate"] or "",
+        "car": r["car"] or "Невідома",
+        "plate": "",
         "comment": r["comment"] or "",
         "status": STATUS_UA.get(r["status"], r["status"]),
     }
@@ -141,7 +143,8 @@ async def push_sheet(booking_id: int) -> None:
 
 async def update_status(booking_id: int, status: str, final_time: str | None = None) -> None:
     set_status(booking_id, status, final_time)
-    await push_sheet(booking_id)
+    if status == "confirmed":  # у таблицю йдуть лише затверджені замовлення
+        await push_sheet(booking_id)
 
 
 # --------------------------------------------------------------------- стани
@@ -150,7 +153,6 @@ class Booking(StatesGroup):
     phone = State()
     service = State()
     car = State()
-    plate = State()
     day = State()
     time = State()
     comment = State()
@@ -171,7 +173,7 @@ def booking_text(r: sqlite3.Row) -> str:
         f"👤 {e(r['name'])} (<a href=\"tg://user?id={r['user_id']}\">профіль</a>)\n"
         f"📞 {e(r['phone'])}\n"
         f"🛠 {e(r['service'])}\n"
-        f"🚗 {e(r['car'])}, {e(r['plate'])}\n"
+        f"🚗 {e(r['car'] or 'невідома')}\n"
         f"🗓 Бажаний час: <b>{e(r['wanted'])}</b>\n"
         f"💬 {e(r['comment'])}"
     )
@@ -201,6 +203,12 @@ def day_label(d: date) -> str:
 
 
 async def notify_admins(bot: Bot, text: str, reply_markup=None) -> None:
+    if ADMIN_CHAT_ID:
+        try:
+            await bot.send_message(ADMIN_CHAT_ID, text, reply_markup=reply_markup)
+            return
+        except Exception as exc:
+            logging.warning("Не вдалося надіслати в групу %s: %s. Надсилаю адміністраторам особисто", ADMIN_CHAT_ID, exc)
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(admin_id, text, reply_markup=reply_markup)
@@ -267,26 +275,13 @@ async def got_phone_text(m: Message, state: FSMContext):
     await ask_service(m, state, phone)
 
 
-@router.callback_query(Booking.service, F.data.startswith("svc:"))
-async def got_service(cb: CallbackQuery, state: FSMContext):
-    service = SERVICES[int(cb.data.split(":")[1])]
-    await state.update_data(service=service)
-    await state.set_state(Booking.car)
-    await cb.message.edit_text(f"Послуга: <b>{e(service)}</b>")
-    await cb.message.answer("Яка марка і модель вашого авто? (напр. Skoda Octavia)")
-    await cb.answer()
+def skip_kb(data: str):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Не знаю / пропустити", callback_data=data)
+    return kb.as_markup()
 
 
-@router.message(Booking.car, F.text)
-async def got_car(m: Message, state: FSMContext):
-    await state.update_data(car=m.text.strip()[:60])
-    await state.set_state(Booking.plate)
-    await m.answer("Який номерний знак авто? (напр. AT1234AA)")
-
-
-@router.message(Booking.plate, F.text)
-async def got_plate(m: Message, state: FSMContext):
-    await state.update_data(plate=m.text.strip().upper()[:15])
+async def ask_day(message: Message, state: FSMContext):
     await state.set_state(Booking.day)
     kb = InlineKeyboardBuilder()
     today = now_local().date()
@@ -294,7 +289,34 @@ async def got_plate(m: Message, state: FSMContext):
         d = today + timedelta(days=i)
         kb.button(text=day_label(d), callback_data=f"day:{d.isoformat()}")
     kb.adjust(2)
-    await m.answer("Оберіть бажаний день:", reply_markup=kb.as_markup())
+    await message.answer("Оберіть бажаний день:", reply_markup=kb.as_markup())
+
+
+@router.callback_query(Booking.service, F.data.startswith("svc:"))
+async def got_service(cb: CallbackQuery, state: FSMContext):
+    service = SERVICES[int(cb.data.split(":")[1])]
+    await state.update_data(service=service)
+    await state.set_state(Booking.car)
+    await cb.message.edit_text(f"Послуга: <b>{e(service)}</b>")
+    await cb.message.answer(
+        "Яка марка і модель вашого авто? (напр. Skoda Octavia)\nЯкщо не знаєте, натисніть «Пропустити».",
+        reply_markup=skip_kb("skip_car"),
+    )
+    await cb.answer()
+
+
+@router.message(Booking.car, F.text)
+async def got_car(m: Message, state: FSMContext):
+    await state.update_data(car=m.text.strip()[:60])
+    await ask_day(m, state)
+
+
+@router.callback_query(Booking.car, F.data == "skip_car")
+async def skip_car(cb: CallbackQuery, state: FSMContext):
+    await state.update_data(car="Невідома")
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await ask_day(cb.message, state)
+    await cb.answer()
 
 
 @router.callback_query(Booking.day, F.data.startswith("day:"))
@@ -309,7 +331,7 @@ async def got_day(cb: CallbackQuery, state: FSMContext):
     if not slots:
         await cb.answer("На цей день вільних годин уже немає. Оберіть інший день.", show_alert=True)
         return
-    await state.update_data(day=day_label(d))
+    await state.update_data(day=day_label(d), day_iso=d.isoformat())
     await state.set_state(Booking.time)
     kb = InlineKeyboardBuilder()
     for t in slots:
@@ -339,11 +361,14 @@ async def got_time(cb: CallbackQuery, state: FSMContext):
 async def finalize(bot: Bot, chat_id: int, user_id: int, state: FSMContext, comment: str | None):
     data = await state.get_data()
     wanted = f"{data['day']}, {data['time']}"
+    visit_date = date.fromisoformat(data["day_iso"])
+    wanted_plain = f"{visit_date.strftime('%d.%m.%Y')} ({WEEKDAYS[visit_date.weekday()]}), {data['time']}"
     with db() as c:
         cur = c.execute(
-            "INSERT INTO bookings (user_id, name, phone, service, car, plate, wanted, comment) "
+            "INSERT INTO bookings (user_id, name, phone, service, car, wanted, wanted_plain, comment) "
             "VALUES (?,?,?,?,?,?,?,?)",
-            (user_id, data["name"], data["phone"], data["service"], data["car"], data["plate"], wanted, comment),
+            (user_id, data["name"], data["phone"], data["service"], data.get("car") or "Невідома",
+             wanted, wanted_plain, comment),
         )
         booking_id = cur.lastrowid
     await state.clear()
@@ -351,13 +376,12 @@ async def finalize(bot: Bot, chat_id: int, user_id: int, state: FSMContext, comm
     await bot.send_message(
         chat_id,
         f"✅ Дякуємо, {e(data['name'])}! Ваш запит прийнято.\n\n"
-        f"🛠 {e(data['service'])}\n🚗 {e(data['car'])}, {e(data['plate'])}\n"
+        f"🛠 {e(data['service'])}\n🚗 {e(data['car'] or 'Невідома')}\n"
         f"🗓 Бажаний час: <b>{e(wanted)}</b>\n\n"
         "Ми повідомимо вас про точний час прийому, який ми зможемо запропонувати.",
         reply_markup=main_kb(),
     )
     await notify_admins(bot, booking_text(get_booking(booking_id)), admin_kb(booking_id))
-    await push_sheet(booking_id)
 
 
 @router.message(Booking.comment, F.text)
@@ -386,7 +410,7 @@ async def admin_action(cb: CallbackQuery, state: FSMContext, bot: Bot):
         return
 
     if action == "ok":
-        await update_status(booking_id, "confirmed", r["wanted"])
+        await update_status(booking_id, "confirmed", r["wanted_plain"] or r["wanted"])
         await bot.send_message(
             r["user_id"],
             f"✅ Ваш запис підтверджено на <b>{e(r['wanted'])}</b>. Чекаємо на вас!",
@@ -397,8 +421,8 @@ async def admin_action(cb: CallbackQuery, state: FSMContext, bot: Bot):
         await state.set_state(Propose.waiting_time)
         await state.update_data(booking_id=booking_id)
         await cb.message.answer(
-            f"Напишіть, який час запропонувати клієнту (запит #{booking_id}), "
-            "напр.: «післязавтра о 15:00».\nСкасувати: /cancel"
+            f"Натисніть «Відповісти» (Reply) на це повідомлення і напишіть, який час запропонувати клієнту "
+            f"(запит #{booking_id}), напр.: «післязавтра о 15:00».\nСкасувати: /cancel"
         )
 
     elif action == "no":
@@ -472,6 +496,11 @@ async def client_reply(cb: CallbackQuery, bot: Bot):
     await cb.answer()
 
 
+@router.message(Command("chatid"))
+async def chat_id(m: Message):
+    await m.answer(f"ID цього чату: <code>{m.chat.id}</code>")
+
+
 @router.message(Command("myid"))
 async def my_id(m: Message):
     status = "ви в списку адміністраторів ✅" if is_admin(m.from_user.id) else "вас НЕМАЄ в списку адміністраторів ❌"
@@ -505,7 +534,7 @@ async def list_confirmed(m: Message):
     await m.answer(
         "\n".join(
             f"#{r['id']} {e(r['final_time'])} — {e(r['name'])}, {e(r['phone'])}, "
-            f"{e(r['service'])}, {e(r['car'])} {e(r['plate'])}"
+            f"{e(r['service'])}, {e(r['car'])}"
             for r in rows
         )
     )
@@ -533,6 +562,7 @@ async def start_web_server() -> None:
 async def main():
     logging.basicConfig(level=logging.INFO)
     logging.info("Адміністратори (ADMIN_IDS): %s", sorted(ADMIN_IDS))
+    logging.info("Чат для запитів (ADMIN_CHAT_ID): %s", ADMIN_CHAT_ID or "не задано, запити йдуть адміністраторам особисто")
     if not ADMIN_IDS:
         logging.warning("ADMIN_IDS не заданий — адміністратор не отримуватиме запити!")
     if not SHEET_URL:
