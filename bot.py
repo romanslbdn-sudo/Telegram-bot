@@ -566,7 +566,7 @@ async def start_web_server() -> None:
 
 
 async def keep_awake() -> None:
-    """Самопробудження: кожні 10 хвилин бот заходить на власну адресу,
+    """Самопробудження: кожні 3 хвилини бот заходить на власну адресу,
     тож безкоштовний Render не вважає сервіс неактивним і не присипляє його.
     RENDER_EXTERNAL_URL Render задає сам; можна перевизначити через SELF_URL."""
     url = os.getenv("SELF_URL") or os.getenv("RENDER_EXTERNAL_URL")
@@ -580,7 +580,7 @@ async def keep_awake() -> None:
                     logging.info("Самопробудження: %s -> %s", url, resp.status)
         except Exception as exc:
             logging.warning("Самопробудження не вдалося: %s", exc)
-        await asyncio.sleep(600)
+        await asyncio.sleep(180)
 
 
 async def main():
