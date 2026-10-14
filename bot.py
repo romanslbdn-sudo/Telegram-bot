@@ -56,7 +56,9 @@ MIN_LEAD_MINUTES = int(os.getenv("MIN_LEAD_MINUTES", "60"))
 # Відредагуйте під себе
 SERVICES = ["Хімчистка", "Поліровка", "Оптика"]
 TIME_SLOTS = ["10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00", "19:00"]  # з 10:00 до 19:00
-DAYS_AHEAD = 7
+DAYS_AHEAD = 7  # скільки робочих днів показувати
+WORK_DAYS = {0, 1, 2, 3, 4}  # пн–пт
+WORK_HOURS_TEXT = "🕙 Ми працюємо з понеділка по пʼятницю, з 10:00 до 19:00."
 WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "нд"]
 
 STATUS_UA = {
@@ -225,7 +227,7 @@ def is_admin(user_id: int) -> bool:
 async def cmd_start(m: Message, state: FSMContext):
     await state.clear()
     await m.answer(
-        "Вітаємо! 👋 Я допоможу залишити запит на запис.\nНатисніть кнопку нижче.",
+        f"Вітаємо! 👋 Я допоможу залишити запит на запис.\n\n{WORK_HOURS_TEXT}\n\nНатисніть кнопку нижче.",
         reply_markup=main_kb(),
     )
 
@@ -285,11 +287,17 @@ async def ask_day(message: Message, state: FSMContext):
     await state.set_state(Booking.day)
     kb = InlineKeyboardBuilder()
     today = now_local().date()
-    for i in range(DAYS_AHEAD):
-        d = today + timedelta(days=i)
-        kb.button(text=day_label(d), callback_data=f"day:{d.isoformat()}")
+    shown, d = 0, today
+    while shown < DAYS_AHEAD:
+        if d.weekday() in WORK_DAYS:
+            kb.button(text=day_label(d), callback_data=f"day:{d.isoformat()}")
+            shown += 1
+        d += timedelta(days=1)
     kb.adjust(2)
-    await message.answer("Оберіть бажаний день:", reply_markup=kb.as_markup())
+    await message.answer(
+        f"{WORK_HOURS_TEXT}\nСубота й неділя вихідні.\n\nОберіть бажаний день:",
+        reply_markup=kb.as_markup(),
+    )
 
 
 @router.callback_query(Booking.service, F.data.startswith("svc:"))
